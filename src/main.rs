@@ -1,5 +1,4 @@
 use std::{
-    collections::VecDeque,
     fs,
     io::{BufRead, BufReader, Write},
     marker::Send,
@@ -10,9 +9,7 @@ use std::{
 };
 
 struct Worker {
-    id: u32,
-    handle: JoinHandle<()>,
-    receiver: Arc<Mutex<mpsc::Receiver<Job>>>,
+    thread: Option<JoinHandle<()>>,
 }
 
 type Job = Box<dyn FnOnce() + Send + 'static>;
@@ -20,21 +17,25 @@ type Job = Box<dyn FnOnce() + Send + 'static>;
 impl Worker {
     pub fn new(id: u32, receiver: Arc<Mutex<mpsc::Receiver<Job>>>) -> Worker {
         Worker {
-            id,
-            receiver: receiver.clone(),
-            handle: thread::spawn(move || loop {
-                let f = receiver.lock().unwrap().recv().unwrap();
-                println!("Got a new task worker_id:{id}");
-                f();
-            }),
+            thread: Some(thread::spawn(move || loop {
+                let f = receiver.lock().unwrap().recv();
+                match f {
+                    Ok(f) => {
+                        println!("Got a new task worker_id:{id}");
+                        f();
+                    }
+                    Err(_) => {
+                        println!("Worker {id} disconnected, exiting...");
+                        break;
+                    }
+                }
+            })),
         }
     }
 }
 
 struct ThreadPool {
-    size: usize,
-    tx: mpsc::Sender<Job>,
-    queue: VecDeque<Job>,
+    tx: Option<mpsc::Sender<Job>>,
     workers: Vec<Worker>,
 }
 
@@ -50,18 +51,34 @@ impl ThreadPool {
         }
 
         ThreadPool {
-            size,
-            tx,
-            queue: VecDeque::new(),
+            tx: Some(tx),
             workers,
         }
     }
 
-    fn run<T>(&mut self, job: T)
+    fn run<T>(&mut self, job: T) -> Result<(), &str>
     where
         T: FnOnce() + Send + 'static,
     {
-        self.tx.send(Box::new(job)).unwrap();
+        if let Some(tx) = &self.tx {
+            tx.send(Box::new(job)).unwrap();
+            return Ok(());
+        } else {
+            return Err("sender already dropped");
+        }
+    }
+}
+
+impl Drop for ThreadPool {
+    fn drop(&mut self) {
+        let tx = self.tx.take();
+        drop(tx);
+
+        for worker in &mut self.workers {
+            if let Some(thread) = worker.thread.take() {
+                thread.join().unwrap();
+            }
+        }
     }
 }
 
@@ -69,10 +86,10 @@ fn main() {
     let tcp_listener = TcpListener::bind("0.0.0.0:7878").unwrap();
     println!("Server started");
     let mut pool = ThreadPool::new(10);
-    for stream in tcp_listener.incoming() {
+    for stream in tcp_listener.incoming().take(2) {
         let stream = stream.unwrap();
         println!("Incoming connection accepted");
-        pool.run(move || handle_connection(stream));
+        pool.run(move || handle_connection(stream)).unwrap();
     }
 }
 
