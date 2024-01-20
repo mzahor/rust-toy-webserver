@@ -1,9 +1,12 @@
 use std::{
     fs,
-    io::{BufRead, BufReader, Write},
+    io::{BufRead, BufReader, ErrorKind, Write},
     marker::Send,
     net::{TcpListener, TcpStream},
-    sync::{mpsc, Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Arc, Mutex,
+    },
     thread::{self, JoinHandle},
     time::Duration,
 };
@@ -86,25 +89,56 @@ fn main() {
     let tcp_listener = TcpListener::bind("0.0.0.0:7878").unwrap();
     println!("Server started");
     let mut pool = ThreadPool::new(10);
-    for stream in tcp_listener.incoming().take(2) {
-        let stream = stream.unwrap();
-        println!("Incoming connection accepted");
-        pool.run(move || handle_connection(stream)).unwrap();
+    let should_exit = Arc::new(AtomicBool::new(false));
+
+    {
+        let should_exit = should_exit.clone();
+        ctrlc::set_handler(move || should_exit.store(true, Ordering::SeqCst))
+            .expect("Failed to set Ctrl+C handler");
+    }
+
+    tcp_listener
+        .set_nonblocking(true)
+        .expect("Failed to set non-blocking");
+
+    for stream in tcp_listener.incoming() {
+        match stream {
+            Ok(stream) => {
+                println!("Incoming connection accepted");
+                pool.run(move || handle_connection(stream)).unwrap();
+            }
+            Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                if should_exit.load(Ordering::SeqCst) {
+                    println!("Ctrl+C pressed, exiting...");
+                    break;
+                }
+                // loop
+            }
+            Err(err) => {
+                println!("Failed connection {err}");
+            }
+        }
     }
 }
 
 fn handle_connection(mut stream: TcpStream) {
     let reader = BufReader::new(&mut stream);
-    let request = reader.lines().next().unwrap().unwrap();
-    let (file, status) = match &request[..] {
-        "GET / HTTP/1.1" => ("index.html", "200 OK"),
-        "GET /sleep HTTP/1.1" => {
-            thread::sleep(Duration::from_secs(5));
-            ("sleep.html", "200 OK")
+    match reader.lines().next().unwrap() {
+        Ok(request) => {
+            let (file, status) = match &request[..] {
+                "GET / HTTP/1.1" => ("index.html", "200 OK"),
+                "GET /sleep HTTP/1.1" => {
+                    thread::sleep(Duration::from_secs(5));
+                    ("sleep.html", "200 OK")
+                }
+                _ => ("404.html", "404 NOT FOUND"),
+            };
+            response_file(&mut stream, file, status);
         }
-        _ => ("404.html", "404 NOT FOUND"),
-    };
-    response_file(&mut stream, file, status);
+        Err(err) => {
+            println!("Handle connection error: {err}");
+        }
+    }
 }
 
 fn response_file(stream: &mut TcpStream, fname: &str, status: &str) {
