@@ -112,6 +112,7 @@ fn main() {
                     println!("Ctrl+C pressed, exiting...");
                     break;
                 }
+                thread::yield_now();
                 // loop
             }
             Err(err) => {
